@@ -12,7 +12,8 @@ Two extensions, two op namespaces:
                                SM90, and the V3.2 / V3.2-no-RoPE / V4 KV cache formats
 
 The legacy half is optional, so a build made with FLASH_MLA_BUILD_LEGACY=0 still imports; asking
-for a legacy kernel then raises instead of failing at load time.
+for a legacy kernel then raises instead of failing at load time. The current half is optional
+the same way (FLASH_MLA_BUILD_CURRENT=0, for a legacy-only build on a pre-13.1 toolchain).
 """
 
 import glob
@@ -23,6 +24,7 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
+_CURRENT_UNAVAILABLE: Optional[str] = None
 _LEGACY_UNAVAILABLE: Optional[str] = None
 
 
@@ -36,11 +38,17 @@ def _load(stem: str) -> bool:
     return True
 
 
-if not _load("cuda"):
-    raise ImportError(
-        f"FlashMLA's CUDA extension was not found in {_HERE}. "
-        "Build it with `pip install -v . --no-build-isolation`."
-    )
+try:
+    _has_current = _load("cuda")
+except OSError as exc:  # a library that is present but will not load is worth reporting
+    _has_current = False
+    _CURRENT_UNAVAILABLE = str(exc)
+else:
+    if not _has_current:
+        _CURRENT_UNAVAILABLE = (
+            f"FlashMLA's CUDA extension was not found in {_HERE}. "
+            "Build it with `pip install -v . --no-build-isolation`."
+        )
 
 try:
     _has_legacy = _load("_C_legacy")
@@ -55,6 +63,11 @@ else:
 def get_ops(use_legacy: bool):
     """The op namespace to call, picked by the caller's `use_legacy`."""
     if not use_legacy:
+        if not _has_current:
+            raise RuntimeError(
+                f"The current FlashMLA kernels (V4.1 on SM100) are not available: "
+                f"{_CURRENT_UNAVAILABLE}."
+            )
         return torch.ops.flash_mla
     if not _has_legacy:
         raise RuntimeError(

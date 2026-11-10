@@ -15,6 +15,14 @@ OUR_OP_SOURCES = ["csrc_ops/sched_meta.cpp"]
 EXT_NAME_LEGACY = "flash_mla._C_legacy"
 BUILD_LEGACY = os.environ.get("FLASH_MLA_BUILD_LEGACY", "1") == "1"
 
+# FLASH_MLA_BUILD_CURRENT=0 builds the legacy extension alone, for a toolchain that cannot
+# compile the current kernels (they need NVCC 13.1 for `cvt` with `.scaled::n2::ue8m0`, e.g.
+# CUDA 12.9 on an SM90-only machine). The current ops then raise at call time instead of at
+# import time; see flash_mla/_loader.py. FLASH_MLA_LEGACY_ARCHS overrides the legacy side's
+# `-gencode` targets the same way, so a legacy-only build can drop the sm100/sm103 code it
+# will never run.
+BUILD_CURRENT = os.environ.get("FLASH_MLA_BUILD_CURRENT", "1") == "1"
+
 # The CUTLASS FMHA dense prefill is upstream's, and it is half the CUDA extension's object code
 # (29 MB of 61 MB) for an op SGLang never calls -- it is not a DeepSeek MLA kernel at all, just a
 # dense attention one that happens to live here. It is left out by default; a build that needs
@@ -131,8 +139,9 @@ def build_on_cuda_platform():
     nvcc_version_number = nvcc_version.split("release ")[1].split(",")[0].strip()
     major, minor = map(int, nvcc_version_number.split("."))
     print(f"Compiling using NVCC {major}.{minor}")
-    assert major > 13 or (major == 13 and minor >= 1), \
-        "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+    if BUILD_CURRENT:
+        assert major > 13 or (major == 13 and minor >= 1), \
+            "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
 
     nvcc_archs = subprocess.check_output(
         [os.path.join(CUDA_HOME, "bin", "nvcc"), "--list-gpu-arch"], text=True
@@ -141,6 +150,12 @@ def build_on_cuda_platform():
         CUDA_ARCHS.append("sm_107a")
         LEGACY_CUDA_ARCHS.append("sm_107a")
 
+    legacy_archs_env = os.environ.get("FLASH_MLA_LEGACY_ARCHS")
+    legacy_archs = (
+        [a.strip() for a in legacy_archs_env.split(",") if a.strip()]
+        if legacy_archs_env else LEGACY_CUDA_ARCHS
+    )
+
     class BuildExtensionWithPostActions(BuildExtension):
         """
         Run the register-spill check after building.
@@ -148,7 +163,8 @@ def build_on_cuda_platform():
         def run(self):
             super().run()
 
-            if not self.dry_run:
+            # The spill check targets the current kernels; a legacy-only build has none.
+            if not self.dry_run and BUILD_CURRENT:
                 from tests.kernelkit import check_kernel_reg_spill_in_artifact
 
                 so_paths = [
@@ -243,6 +259,9 @@ def build_on_cuda_platform():
         ),
     ]
 
+    if not BUILD_CURRENT:
+        ext_modules = []
+
     if BUILD_LEGACY:
         # The frozen tree is built against the stable ABI too. A wheel is only as portable as its
         # least portable extension, so one CPython-locked extension here would undo the abi3 build
@@ -280,7 +299,7 @@ def build_on_cuda_platform():
                     "-DNDEBUG",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
                     "-Xcompiler", "-fvisibility=hidden",
-                ] + get_cuda_arch_flags(LEGACY_CUDA_ARCHS),
+                ] + get_cuda_arch_flags(legacy_archs),
             },
             include_dirs=[
                 THIS_DIR / "csrc_legacy",
